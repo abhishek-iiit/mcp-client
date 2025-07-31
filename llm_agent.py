@@ -3,6 +3,7 @@ import logging
 from langchain_openai import AzureChatOpenAI
 from langgraph.prebuilt import create_react_agent
 from langchain.tools import BaseTool
+from langchain.schema import HumanMessage, AIMessage
 from typing import List, Dict, Any
 import asyncio
 from mcp_client import MCPClient
@@ -49,6 +50,7 @@ class LLMAgent:
         self.agent = None
         self.tools = []
         self.conversation_history = []
+        self.memory_context = {}
     
     async def initialize(self):
         """Initialize the agent with MCP tools"""
@@ -73,28 +75,43 @@ class LLMAgent:
             )
             self.tools.append(langchain_tool)
         
-        # Create the agent
-        system_prompt = "You are a helpful assistant that can use MCP tools. When users provide information like mobile numbers or OTPs, extract the actual values and pass them as parameters to the tools. Remember previous conversation context including mobile numbers, session IDs, and OTPs mentioned earlier. Do not use placeholder values."
+        # Create the agent with system prompt from .env
+        system_prompt = os.getenv("SYSTEM_PROMPT", "You are a helpful assistant.")
         self.agent = create_react_agent(self.llm, self.tools, state_modifier=system_prompt)
         
         return len(self.tools)
     
     async def chat(self, message: str):
-        """Chat with the agent"""
+        """Chat with the agent with enhanced memory"""
         if not self.agent:
             return "Agent not initialized. Please initialize first."
         
         try:
             logging.info(f"User message: {message}")
             
-            # Add user message to history
-            self.conversation_history.append(("user", message))
+            # Build context-aware message with memory
+            context_message = self._build_context_message(message)
             
-            # Send full conversation history to agent
-            response = await self.agent.ainvoke({"messages": self.conversation_history})
+            # Convert conversation history to proper message format
+            messages = []
+            for role, content in self.conversation_history:
+                if role == "user":
+                    messages.append(HumanMessage(content=content))
+                else:
+                    messages.append(AIMessage(content=content))
             
-            # Get assistant response and add to history
+            # Add current message
+            messages.append(HumanMessage(content=context_message))
+            
+            # Send to agent
+            response = await self.agent.ainvoke({"messages": messages})
+            
+            # Get assistant response
             assistant_response = response["messages"][-1].content
+            
+            # Update memory and history
+            self._update_memory(message, assistant_response)
+            self.conversation_history.append(("user", message))
             self.conversation_history.append(("assistant", assistant_response))
             
             logging.info(f"Agent response: {assistant_response}")
@@ -102,3 +119,52 @@ class LLMAgent:
         except Exception as e:
             logging.error(f"Chat error: {e}")
             return f"Error: {e}"
+    
+    def _build_context_message(self, message: str) -> str:
+        """Build message with relevant context from memory"""
+        if not self.memory_context:
+            return message
+        
+        context_parts = []
+        for key, value in self.memory_context.items():
+            if isinstance(value, (str, int, float)):
+                context_parts.append(f"{key}: {value}")
+        
+        if context_parts:
+            context = ", ".join(context_parts)
+            return f"Context: {context}. {message}"
+        
+        return message
+    
+    def _update_memory(self, user_message: str, assistant_response: str):
+        """Extract and store loan flow specific information"""
+        import re
+        
+        text = user_message + " " + assistant_response
+        
+        # Extract phone numbers
+        phone_pattern = r'\b(?:\+91[\s-]?)?[6-9]\d{9}\b'
+        phones = re.findall(phone_pattern, text)
+        if phones:
+            self.memory_context['phone'] = phones[-1].strip()
+        
+        # Extract PAN
+        pan_pattern = r'\b[A-Z]{5}[0-9]{4}[A-Z]\b'
+        pans = re.findall(pan_pattern, text)
+        if pans:
+            self.memory_context['pan'] = pans[-1]
+        
+        # Extract lead ID
+        lead_patterns = [r'lead[_\s]?id[:\s]*([A-Za-z0-9-]+)', r'leadId[:\s]*([A-Za-z0-9-]+)']
+        for pattern in lead_patterns:
+            matches = re.findall(pattern, assistant_response, re.IGNORECASE)
+            if matches:
+                self.memory_context['lead_id'] = matches[-1]
+        
+        # Extract credit score
+        score_pattern = r'credit[_\s]?score[:\s]*(\d{3})'  
+        scores = re.findall(score_pattern, assistant_response, re.IGNORECASE)
+        if scores:
+            self.memory_context['credit_score'] = scores[-1]
+        
+        logging.info(f"Updated memory: {self.memory_context}")

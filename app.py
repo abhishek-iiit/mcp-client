@@ -39,6 +39,21 @@ with st.sidebar:
                 st.success(f"✅ Connected! Found {tool_count} tools")
             except Exception as e:
                 st.error(f"❌ Connection failed: {e}")
+    
+    # Display memory context if agent is initialized
+    if st.session_state.initialized and st.session_state.agent:
+        st.header("🧠 Memory Context")
+        memory = st.session_state.agent.memory_context
+        if memory:
+            for key, value in memory.items():
+                st.text(f"**{key.replace('_', ' ').title()}:** {value}")
+        else:
+            st.text("No stored context yet")
+        
+        if st.button("🗑️ Clear Memory"):
+            st.session_state.agent.memory_context = {}
+            st.success("Memory cleared!")
+            st.rerun()
 
 # Main chat interface
 if st.session_state.initialized:
@@ -81,6 +96,8 @@ else:
 
 # Clear chat button
 if st.session_state.messages:
-    if st.button("🗑️ Clear Chat"):
+    if st.button("🗑️ Clear Chat History"):
         st.session_state.messages = []
+        if st.session_state.agent:
+            st.session_state.agent.conversation_history = []
         st.rerun()
