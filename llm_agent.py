@@ -47,6 +47,7 @@ class MCPTool(BaseTool):
             # Store response data in agent's memory
             if hasattr(self.mcp_client, 'agent_instance') and self.mcp_client.agent_instance:
                 self.mcp_client.agent_instance._store_response_data(self.name, result)
+                self.mcp_client.agent_instance._advance_workflow_step(self.name)
             
             return str(result)
         finally:
@@ -68,6 +69,11 @@ class LLMAgent:
         self.tools = []
         self.conversation_history = []
         self.memory_context = {}
+        self.workflow_steps = [
+            'verify_phone', 'verify_pan', 'initiate_lead', 'fetch_credit_score',
+            'update_lead', 'generate_loan_offer', 'fetch_offers', 'clone_leads', 'call_provider_api'
+        ]
+        self.current_step = 0
     
     async def initialize(self):
         """Initialize the agent with MCP tools"""
@@ -138,53 +144,75 @@ class LLMAgent:
             return f"Error: {e}"
     
     def _build_context_message(self, message: str) -> str:
-        """Build message with relevant context from memory"""
-        if not self.memory_context:
-            return message
+        """Build message with relevant context from memory and enforce system prompt"""
+        system_prompt = os.getenv("SYSTEM_PROMPT", "")
         
         context_parts = []
-        for key, value in self.memory_context.items():
-            if isinstance(value, (str, int, float)):
-                context_parts.append(f"{key}: {value}")
-            elif isinstance(value, dict) and value:  # Include response data
-                context_parts.append(f"{key}: {value}")
+        if self.memory_context:
+            for key, value in self.memory_context.items():
+                if isinstance(value, (str, int, float)):
+                    context_parts.append(f"{key}: {value}")
+                elif isinstance(value, dict) and value:
+                    context_parts.append(f"{key}: {value}")
+        
+        # Build the enhanced message with workflow step enforcement
+        enhanced_message = f"{system_prompt}\n\n"
+        
+        if self.current_step < len(self.workflow_steps):
+            current_step_name = self.workflow_steps[self.current_step].replace('_', ' ').title()
+            enhanced_message += f"CURRENT STEP: {self.current_step + 1}) {current_step_name}\n"
+            enhanced_message += f"Focus ONLY on completing this step. Do not proceed to the next step.\n\n"
         
         if context_parts:
             context = ", ".join(context_parts)
-            return f"Context: {context}. {message}"
+            enhanced_message += f"Previous context: {context}\n\n"
         
-        return message
+        enhanced_message += f"User request: {message}"
+        
+        return enhanced_message
     
     def _update_memory(self, user_message: str, assistant_response: str):
-        """Extract and store loan flow specific information"""
+        """Extract and store loan flow specific information, always updating with latest values"""
         import re
         
         text = user_message + " " + assistant_response
         
-        # Extract phone numbers
+        # Extract phone numbers - always update with latest
         phone_pattern = r'\b(?:\+91[\s-]?)?[6-9]\d{9}\b'
         phones = re.findall(phone_pattern, text)
         if phones:
-            self.memory_context['phone'] = phones[-1].strip()
+            latest_phone = phones[-1].strip()
+            if self.memory_context.get('phone') != latest_phone:
+                self.memory_context['phone'] = latest_phone
+                logging.info(f"Updated phone: {latest_phone}")
         
-        # Extract PAN
+        # Extract PAN - always update with latest
         pan_pattern = r'\b[A-Z]{5}[0-9]{4}[A-Z]\b'
         pans = re.findall(pan_pattern, text)
         if pans:
-            self.memory_context['pan'] = pans[-1]
+            latest_pan = pans[-1]
+            if self.memory_context.get('pan') != latest_pan:
+                self.memory_context['pan'] = latest_pan
+                logging.info(f"Updated PAN: {latest_pan}")
         
-        # Extract lead ID
+        # Extract lead ID - always update with latest
         lead_patterns = [r'lead[_\s]?id[:\s]*([A-Za-z0-9-]+)', r'leadId[:\s]*([A-Za-z0-9-]+)']
         for pattern in lead_patterns:
             matches = re.findall(pattern, assistant_response, re.IGNORECASE)
             if matches:
-                self.memory_context['lead_id'] = matches[-1]
+                latest_lead_id = matches[-1]
+                if self.memory_context.get('lead_id') != latest_lead_id:
+                    self.memory_context['lead_id'] = latest_lead_id
+                    logging.info(f"Updated lead_id: {latest_lead_id}")
         
-        # Extract credit score
+        # Extract credit score - always update with latest
         score_pattern = r'credit[_\s]?score[:\s]*(\d{3})'  
         scores = re.findall(score_pattern, assistant_response, re.IGNORECASE)
         if scores:
-            self.memory_context['credit_score'] = scores[-1]
+            latest_score = scores[-1]
+            if self.memory_context.get('credit_score') != latest_score:
+                self.memory_context['credit_score'] = latest_score
+                logging.info(f"Updated credit_score: {latest_score}")
         
         logging.info(f"Updated memory: {self.memory_context}")
     
@@ -201,13 +229,35 @@ class LLMAgent:
                     if text_content:
                         data = json.loads(text_content)
                         
-                        # Store all response data dynamically
+                        # Store all response data dynamically, always updating with latest values
                         if 'data' in data and isinstance(data['data'], dict):
                             response_data = data['data']
                             for key, value in response_data.items():
                                 if value and value != 'NA':  # Store non-empty, non-NA values
                                     # Convert camelCase to snake_case for consistency
                                     snake_key = ''.join(['_' + c.lower() if c.isupper() else c for c in key]).lstrip('_')
+                                    # Always update with latest value
                                     self.memory_context[snake_key] = value
+                                    logging.info(f"Updated memory key '{snake_key}' with new value: {value}")
         except (json.JSONDecodeError, KeyError, TypeError):
             pass  # Ignore parsing errors
+    
+    def _advance_workflow_step(self, tool_name: str):
+        """Advance workflow step based on completed tool"""
+        step_mapping = {
+            'verifyOtpToAuthenticateUser': 0,  # verify_phone
+            'verifyPanCard': 1,  # verify_pan
+            'initiateLead': 2,  # initiate_lead
+            'fetchCreditScore': 3,  # fetch_credit_score
+            'updateLead': 4,  # update_lead
+            'generateLoanOffer': 5,  # generate_loan_offer
+            'fetchOffers': 6,  # fetch_offers
+            'cloneLeads': 7,  # clone_leads
+            'callProviderApi': 8  # call_provider_api
+        }
+        
+        if tool_name in step_mapping:
+            expected_step = step_mapping[tool_name]
+            if self.current_step == expected_step:
+                self.current_step += 1
+                logging.info(f"Advanced to step {self.current_step}")
