@@ -25,13 +25,29 @@ class MCPTool(BaseTool):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            # Clean up arguments - remove any placeholder values
-            clean_args = {k: v for k, v in kwargs.items() if not (isinstance(v, str) and v.startswith('{') and v.endswith('}'))}
+            # Clean up arguments and replace placeholders with stored values
+            clean_args = {}
+            for k, v in kwargs.items():
+                if isinstance(v, str) and v.endswith('_placeholder'):
+                    # Extract key name from placeholder (e.g., 'session_id_placeholder' -> 'session_id')
+                    key_name = v.replace('_placeholder', '')
+                    if hasattr(self.mcp_client, 'agent_instance') and self.mcp_client.agent_instance:
+                        stored_value = self.mcp_client.agent_instance.memory_context.get(key_name)
+                        clean_args[k] = stored_value if stored_value else v
+                    else:
+                        clean_args[k] = v
+                elif not (isinstance(v, str) and v.startswith('{') and v.endswith('}')):
+                    clean_args[k] = v
             logging.info(f"Cleaned args: {clean_args}")
             result = loop.run_until_complete(
                 self.mcp_client.call_tool(self.name, clean_args)
             )
             logging.info(f"MCP tool result: {result}")
+            
+            # Store response data in agent's memory
+            if hasattr(self.mcp_client, 'agent_instance') and self.mcp_client.agent_instance:
+                self.mcp_client.agent_instance._store_response_data(self.name, result)
+            
             return str(result)
         finally:
             loop.close()
@@ -47,6 +63,7 @@ class LLMAgent:
             azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT")
         )
         self.mcp_client = MCPClient(os.getenv("MCP_SERVER_URL"))
+        self.mcp_client.agent_instance = self  # Reference for tools to access agent
         self.agent = None
         self.tools = []
         self.conversation_history = []
@@ -129,6 +146,8 @@ class LLMAgent:
         for key, value in self.memory_context.items():
             if isinstance(value, (str, int, float)):
                 context_parts.append(f"{key}: {value}")
+            elif isinstance(value, dict) and value:  # Include response data
+                context_parts.append(f"{key}: {value}")
         
         if context_parts:
             context = ", ".join(context_parts)
@@ -168,3 +187,27 @@ class LLMAgent:
             self.memory_context['credit_score'] = scores[-1]
         
         logging.info(f"Updated memory: {self.memory_context}")
+    
+    def _store_response_data(self, tool_name: str, response: Any):
+        """Store MCP tool response data in memory"""
+        import json
+        
+        try:
+            # Parse response if it's a string containing JSON
+            if isinstance(response, dict) and 'content' in response:
+                content = response['content']
+                if isinstance(content, list) and content:
+                    text_content = content[0].get('text', '')
+                    if text_content:
+                        data = json.loads(text_content)
+                        
+                        # Store all response data dynamically
+                        if 'data' in data and isinstance(data['data'], dict):
+                            response_data = data['data']
+                            for key, value in response_data.items():
+                                if value and value != 'NA':  # Store non-empty, non-NA values
+                                    # Convert camelCase to snake_case for consistency
+                                    snake_key = ''.join(['_' + c.lower() if c.isupper() else c for c in key]).lstrip('_')
+                                    self.memory_context[snake_key] = value
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass  # Ignore parsing errors
