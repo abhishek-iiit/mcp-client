@@ -29,3 +29,5 @@ Configuration is loaded from `.env` file:
 
 The app will automatically discover and integrate all available tools from your MCP server.
 Thanks for reading this far 😁
+
+
