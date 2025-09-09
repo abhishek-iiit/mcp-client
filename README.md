@@ -28,6 +28,4 @@ Configuration is loaded from `.env` file:
 - **Azure OpenAI**: Configure endpoint, API key, and deployment
 
 The app will automatically discover and integrate all available tools from your MCP server.
-Thanks for reading this far 😁
-
-
+Thanks for reading this far
